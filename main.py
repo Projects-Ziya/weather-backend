@@ -14,9 +14,7 @@ GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 MODEL_PATH = "ml/temperature_model_old.pkl"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache"
+    "User-Agent": "Mozilla/5.0"
 }
 
 # ==================================================
@@ -37,6 +35,7 @@ app.add_middleware(
 # ==================================================
 try:
     model = load(MODEL_PATH)
+    print("✅ ML model loaded")
 except Exception as e:
     model = None
     print("❌ Model loading failed:", e)
@@ -56,13 +55,12 @@ def get_location(place: str):
             GEOCODE_URL,
             params={"name": place, "count": 1},
             headers=HEADERS,
-            timeout=10
+            timeout=15
         )
         r.raise_for_status()
         data = r.json()
 
-        if "results" not in data or not data["results"]:
-            print("❌ Location not found:", place)
+        if not data.get("results"):
             return None, None
 
         loc = data["results"][0]
@@ -87,33 +85,37 @@ def get_live_weather(lat, lon):
             OPEN_METEO_URL,
             params=params,
             headers=HEADERS,
-            timeout=15
+            timeout=20
         )
         r.raise_for_status()
         data = r.json()
 
-        if "current_weather" not in data or "hourly" not in data:
-            raise ValueError("Invalid Open-Meteo response")
+        cw = data.get("current_weather")
+        hourly = data.get("hourly")
 
-        cw = data["current_weather"]
+        if not cw or not hourly:
+            return None
+
+        # Find correct hourly index for current time
+        now = datetime.now().replace(minute=0, second=0, microsecond=0)
+        hourly_times = [datetime.fromisoformat(t) for t in hourly["time"]]
+
+        if now in hourly_times:
+            idx = hourly_times.index(now)
+        else:
+            idx = 0
 
         return {
-            "temperature": cw.get("temperature", 30.0),
-            "wind_speed": cw.get("windspeed", 10.0),
-            "humidity": data["hourly"]["relativehumidity_2m"][0],
-            "precipitation": data["hourly"]["precipitation"][0],
-            "cloud_cover": data["hourly"]["cloudcover"][0]
+            "temperature": float(cw["temperature"]),
+            "wind_speed": float(cw["windspeed"]),
+            "humidity": float(hourly["relativehumidity_2m"][idx]),
+            "precipitation": float(hourly["precipitation"][idx]),
+            "cloud_cover": float(hourly["cloudcover"][idx]),
         }
 
     except Exception as e:
-        print("⚠️ Open-Meteo live weather failed, using fallback:", e)
-        return {
-            "temperature": 30.0,
-            "wind_speed": 10.0,
-            "humidity": 70,
-            "precipitation": 0.0,
-            "cloud_cover": 40
-        }
+        print("❌ Live weather API failed:", e)
+        return None
 
 
 def predict_rain(precipitation, humidity, cloud_cover):
@@ -139,7 +141,7 @@ def get_weather_data(place):
             OPEN_METEO_URL,
             params=params,
             headers=HEADERS,
-            timeout=10
+            timeout=20
         )
         r.raise_for_status()
         data = r.json()
@@ -151,22 +153,8 @@ def get_weather_data(place):
         }
 
     except Exception as e:
-        print("⚠️ Forecast API failed, using fallback:", e)
-
-        today = datetime.now()
-        dates, tmax, tmin = [], [], []
-
-        for i in range(7):
-            d = today + timedelta(days=i)
-            dates.append(d.strftime("%Y-%m-%d"))
-            tmax.append(30.0)
-            tmin.append(24.0)
-
-        return {
-            "dates": dates,
-            "temp_max": tmax,
-            "temp_min": tmin
-        }
+        print("❌ Forecast API failed:", e)
+        return None
 
 
 def get_hourly_weather(lat, lon, hours=12):
@@ -183,7 +171,7 @@ def get_hourly_weather(lat, lon, hours=12):
             OPEN_METEO_URL,
             params=params,
             headers=HEADERS,
-            timeout=10
+            timeout=20
         )
         r.raise_for_status()
         data = r.json()
@@ -207,14 +195,8 @@ def get_hourly_weather(lat, lon, hours=12):
         return hourly
 
     except Exception as e:
-        print("⚠️ Hourly API failed, using fallback:", e)
-        return [
-            {"time": "10:00", "temperature": 29},
-            {"time": "11:00", "temperature": 30},
-            {"time": "12:00", "temperature": 31},
-            {"time": "13:00", "temperature": 32},
-            {"time": "14:00", "temperature": 31},
-        ]
+        print("❌ Hourly forecast failed:", e)
+        return None
 
 # ==================================================
 # HEALTH CHECK
@@ -242,10 +224,9 @@ def get_weather(request: WeatherRequest):
     if lat is None:
         raise HTTPException(status_code=404, detail="Location not found")
 
-    print("🔍 Place requested:", place)
-    print("📍 Coordinates:", lat, lon)
-
     weather = get_live_weather(lat, lon)
+    if weather is None:
+        raise HTTPException(status_code=503, detail="Live weather unavailable")
 
     temperature = weather["temperature"]
     humidity = weather["humidity"]
@@ -291,6 +272,8 @@ def get_weather(request: WeatherRequest):
 @app.get("/forecast7")
 def forecast_7(place: str):
     data = get_weather_data(place)
+    if not data:
+        raise HTTPException(status_code=503, detail="Forecast unavailable")
 
     forecast = []
     for d, tmax, tmin in zip(
@@ -314,6 +297,8 @@ def hourly_forecast(place: str, hours: int = 12):
         raise HTTPException(status_code=404, detail="Location not found")
 
     hourly = get_hourly_weather(lat, lon, hours)
+    if not hourly:
+        raise HTTPException(status_code=503, detail="Hourly data unavailable")
 
     return {
         "place": place,
