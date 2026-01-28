@@ -11,7 +11,6 @@ from fastapi.middleware.cors import CORSMiddleware
 # ==================================================
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
-
 MODEL_PATH = "ml/temperature_model_old.pkl"
 
 # ==================================================
@@ -21,7 +20,7 @@ app = FastAPI(title="AI Weather Prediction Backend API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change to vercel domain later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -46,18 +45,21 @@ class WeatherRequest(BaseModel):
 # UTILITY FUNCTIONS
 # ==================================================
 def get_location(place: str):
-    params = {"name": place, "count": 1}
-    r = requests.get(GEOCODE_URL, params=params, timeout=10)
+    try:
+        r = requests.get(GEOCODE_URL, params={"name": place, "count": 1}, timeout=10)
+        r.raise_for_status()
+        data = r.json()
 
-    if r.status_code != 200:
+        if "results" not in data or not data["results"]:
+            print("❌ Location not found:", place)
+            return None, None
+
+        loc = data["results"][0]
+        return loc["latitude"], loc["longitude"]
+
+    except Exception as e:
+        print("❌ Geocode error:", e)
         return None, None
-
-    data = r.json()
-    if "results" not in data:
-        return None, None
-
-    loc = data["results"][0]
-    return loc["latitude"], loc["longitude"]
 
 
 def get_live_weather(lat, lon):
@@ -69,20 +71,28 @@ def get_live_weather(lat, lon):
         "timezone": "auto"
     }
 
-    r = requests.get(OPEN_METEO_URL, params=params, timeout=10)
-    if r.status_code != 200:
+    try:
+        r = requests.get(OPEN_METEO_URL, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+
+        if "current_weather" not in data or "hourly" not in data:
+            print("❌ Invalid weather response:", data)
+            return None
+
+        cw = data["current_weather"]
+
+        return {
+            "temperature": cw.get("temperature"),
+            "wind_speed": cw.get("windspeed"),
+            "humidity": data["hourly"]["relativehumidity_2m"][0],
+            "precipitation": data["hourly"]["precipitation"][0],
+            "cloud_cover": data["hourly"]["cloudcover"][0]
+        }
+
+    except Exception as e:
+        print("❌ Open-Meteo error:", e)
         return None
-
-    data = r.json()
-    cw = data["current_weather"]
-
-    return {
-        "temperature": cw["temperature"],
-        "wind_speed": cw["windspeed"],
-        "humidity": data["hourly"]["relativehumidity_2m"][0],
-        "precipitation": data["hourly"]["precipitation"][0],
-        "cloud_cover": data["hourly"]["cloudcover"][0]
-    }
 
 
 def predict_rain(precipitation, humidity, cloud_cover):
@@ -103,16 +113,20 @@ def get_weather_data(place):
         "timezone": "auto"
     }
 
-    r = requests.get(OPEN_METEO_URL, params=params, timeout=10)
-    if r.status_code != 200:
-        return None
+    try:
+        r = requests.get(OPEN_METEO_URL, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
 
-    data = r.json()
-    return {
-        "dates": data["daily"]["time"],
-        "temp_max": data["daily"]["temperature_2m_max"],
-        "temp_min": data["daily"]["temperature_2m_min"]
-    }
+        return {
+            "dates": data["daily"]["time"],
+            "temp_max": data["daily"]["temperature_2m_max"],
+            "temp_min": data["daily"]["temperature_2m_min"]
+        }
+
+    except Exception as e:
+        print("❌ Forecast error:", e)
+        return None
 
 
 def get_hourly_weather(lat, lon, hours=12):
@@ -124,28 +138,32 @@ def get_hourly_weather(lat, lon, hours=12):
         "timezone": "auto"
     }
 
-    r = requests.get(OPEN_METEO_URL, params=params, timeout=10)
-    if r.status_code != 200:
+    try:
+        r = requests.get(OPEN_METEO_URL, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        times = data["hourly"]["time"]
+        temps = data["hourly"]["temperature_2m"]
+
+        now = datetime.now()
+        hourly = []
+
+        for t, temp in zip(times, temps):
+            time_obj = datetime.fromisoformat(t)
+            if time_obj >= now:
+                hourly.append({
+                    "time": time_obj.strftime("%H:%M"),
+                    "temperature": round(float(temp), 1)
+                })
+            if len(hourly) == hours:
+                break
+
+        return hourly
+
+    except Exception as e:
+        print("❌ Hourly forecast error:", e)
         return None
-
-    data = r.json()
-    times = data["hourly"]["time"]
-    temps = data["hourly"]["temperature_2m"]
-
-    now = datetime.now()
-    hourly = []
-
-    for t, temp in zip(times, temps):
-        time_obj = datetime.fromisoformat(t)
-        if time_obj >= now:
-            hourly.append({
-                "time": time_obj.strftime("%H:%M"),
-                "temperature": round(float(temp), 1)
-            })
-        if len(hourly) == hours:
-            break
-
-    return hourly
 
 # ==================================================
 # HEALTH CHECK
@@ -254,4 +272,3 @@ def hourly_forecast(place: str, hours: int = 12):
         "hours": hours,
         "hourly_forecast": hourly
     }
-
