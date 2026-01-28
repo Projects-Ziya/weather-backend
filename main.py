@@ -1,7 +1,7 @@
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 from joblib import load
 from fastapi.middleware.cors import CORSMiddleware
@@ -96,14 +96,11 @@ def get_live_weather(lat, lon):
         if not cw or not hourly:
             return None
 
-        # Find correct hourly index for current time
+        # Match current hour with hourly data
         now = datetime.now().replace(minute=0, second=0, microsecond=0)
         hourly_times = [datetime.fromisoformat(t) for t in hourly["time"]]
 
-        if now in hourly_times:
-            idx = hourly_times.index(now)
-        else:
-            idx = 0
+        idx = hourly_times.index(now) if now in hourly_times else 0
 
         return {
             "temperature": float(cw["temperature"]),
@@ -195,7 +192,7 @@ def get_hourly_weather(lat, lon, hours=12):
         return hourly
 
     except Exception as e:
-        print("❌ Hourly forecast failed:", e)
+        print("❌ Hourly API failed:", e)
         return None
 
 # ==================================================
@@ -213,20 +210,21 @@ def health_check():
 # ==================================================
 @app.post("/weather")
 def get_weather(request: WeatherRequest):
-    if model is None:
-        raise HTTPException(status_code=500, detail="Model not loaded")
-
     place = request.place.strip()
     if not place:
-        raise HTTPException(status_code=400, detail="Place is required")
+        return {"status": "error", "message": "Place is required"}
 
     lat, lon = get_location(place)
     if lat is None:
-        raise HTTPException(status_code=404, detail="Location not found")
+        return {"status": "error", "message": "Location not found"}
 
     weather = get_live_weather(lat, lon)
     if weather is None:
-        raise HTTPException(status_code=503, detail="Live weather unavailable")
+        return {
+            "place": place,
+            "status": "unavailable",
+            "message": "Weather service temporarily unavailable"
+        }
 
     temperature = weather["temperature"]
     humidity = weather["humidity"]
@@ -236,18 +234,18 @@ def get_weather(request: WeatherRequest):
 
     feels_like = temperature + (humidity * 0.05)
 
-    tomorrow = datetime.now() + timedelta(days=1)
-
-    model_input = pd.DataFrame([{
-        "tmin": temperature - 2,
-        "tmax": temperature + 2,
-        "prcp": precipitation,
-        "wspd": wind_speed,
-        "month": tomorrow.month,
-        "day": tomorrow.day
-    }])
-
-    predicted_temp = float(model.predict(model_input)[0])
+    predicted_temp = None
+    if model:
+        tomorrow = datetime.now() + timedelta(days=1)
+        model_input = pd.DataFrame([{
+            "tmin": temperature - 2,
+            "tmax": temperature + 2,
+            "prcp": precipitation,
+            "wspd": wind_speed,
+            "month": tomorrow.month,
+            "day": tomorrow.day
+        }])
+        predicted_temp = round(float(model.predict(model_input)[0]), 2)
 
     return {
         "place": place,
@@ -261,7 +259,7 @@ def get_weather(request: WeatherRequest):
             "feels_like": round(feels_like, 1)
         },
         "tomorrow_prediction": {
-            "predicted_avg_temperature": round(predicted_temp, 2),
+            "predicted_avg_temperature": predicted_temp,
             "rain_status": predict_rain(precipitation, humidity, cloud_cover)
         }
     }
@@ -273,7 +271,11 @@ def get_weather(request: WeatherRequest):
 def forecast_7(place: str):
     data = get_weather_data(place)
     if not data:
-        raise HTTPException(status_code=503, detail="Forecast unavailable")
+        return {
+            "place": place,
+            "status": "unavailable",
+            "message": "Forecast temporarily unavailable"
+        }
 
     forecast = []
     for d, tmax, tmin in zip(
@@ -294,11 +296,15 @@ def forecast_7(place: str):
 def hourly_forecast(place: str, hours: int = 12):
     lat, lon = get_location(place)
     if lat is None:
-        raise HTTPException(status_code=404, detail="Location not found")
+        return {"status": "error", "message": "Location not found"}
 
     hourly = get_hourly_weather(lat, lon, hours)
     if not hourly:
-        raise HTTPException(status_code=503, detail="Hourly data unavailable")
+        return {
+            "place": place,
+            "status": "unavailable",
+            "message": "Hourly data temporarily unavailable"
+        }
 
     return {
         "place": place,
