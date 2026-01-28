@@ -1,8 +1,9 @@
 fastapi
 uvicorn
 pandas
+numpy
 joblib
 scikit-learn
 requests
-numpy
 pydantic
+python-multipart
