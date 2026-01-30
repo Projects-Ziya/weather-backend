@@ -1,313 +1,129 @@
 import requests
-import pandas as pd
 from datetime import datetime, timedelta
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from joblib import load
 from fastapi.middleware.cors import CORSMiddleware
 
-# ==================================================
-# CONFIG
-# ==================================================
-OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
-GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
-MODEL_PATH = "ml/temperature_model_old.pkl"
+OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
+GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
-
-# ==================================================
-# FASTAPI APP
-# ==================================================
-app = FastAPI(title="AI Weather Prediction Backend API")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ==================================================
-# LOAD ML MODEL
-# ==================================================
-try:
-    model = load(MODEL_PATH)
-    print("✅ ML model loaded")
-except Exception as e:
-    model = None
-    print("❌ Model loading failed:", e)
-
-# ==================================================
-# REQUEST BODY
-# ==================================================
 class WeatherRequest(BaseModel):
     place: str
 
-# ==================================================
-# UTILITY FUNCTIONS
-# ==================================================
-def get_location(place: str):
-    try:
-        r = requests.get(
-            GEOCODE_URL,
-            params={"name": place, "count": 1},
-            headers=HEADERS,
-            timeout=15
-        )
-        r.raise_for_status()
-        data = r.json()
-
-        if not data.get("results"):
-            return None, None
-
-        loc = data["results"][0]
-        return loc["latitude"], loc["longitude"]
-
-    except Exception as e:
-        print("❌ Geocode error:", e)
+# ================= LOCATION =================
+def get_location(place):
+    r = requests.get(GEOCODE, params={"name": place, "count": 1}).json()
+    if "results" not in r:
         return None, None
+    loc = r["results"][0]
+    return loc["latitude"], loc["longitude"]
 
-
-def get_live_weather(lat, lon):
+# ================= FETCH ALL DATA =================
+def fetch_data(lat, lon):
     params = {
         "latitude": lat,
         "longitude": lon,
-        "current_weather": True,
-        "hourly": "relativehumidity_2m,precipitation,cloudcover,windspeed_10m",
+        "hourly": ",".join([
+            "temperature_2m",
+            "apparent_temperature",
+            "relativehumidity_2m",
+            "precipitation",
+            "cloudcover",
+            "windspeed_10m"
+        ]),
+        "daily": "temperature_2m_max",
+        "forecast_days": 7,
         "timezone": "auto"
     }
 
-    try:
-        r = requests.get(
-            OPEN_METEO_URL,
-            params=params,
-            headers=HEADERS,
-            timeout=20
-        )
-        r.raise_for_status()
-        data = r.json()
+    return requests.get(OPEN_METEO, params=params).json()
 
-        cw = data.get("current_weather")
-        hourly = data.get("hourly")
+# ================= DAY SUMMARY =================
+def summarize_day(data, day_index):
+    h = data["hourly"]
+    target_date = datetime.now().date() + timedelta(days=day_index)
 
-        if not cw or not hourly:
-            return None
+    temps=[]
+    feels=[]
+    hum=[]
+    rain=[]
+    cloud=[]
+    wind=[]
+    hourly_graph=[]
 
-        # Match current hour with hourly data
-        now = datetime.now().replace(minute=0, second=0, microsecond=0)
-        hourly_times = [datetime.fromisoformat(t) for t in hourly["time"]]
+    for i,t in enumerate(h["time"]):
+        dt=datetime.fromisoformat(t)
 
-        idx = hourly_times.index(now) if now in hourly_times else 0
+        if dt.date()!=target_date:
+            continue
 
-        return {
-            "temperature": float(cw["temperature"]),
-            "wind_speed": float(cw["windspeed"]),
-            "humidity": float(hourly["relativehumidity_2m"][idx]),
-            "precipitation": float(hourly["precipitation"][idx]),
-            "cloud_cover": float(hourly["cloudcover"][idx]),
-        }
+        temps.append(h["temperature_2m"][i])
+        feels.append(h["apparent_temperature"][i])
+        hum.append(h["relativehumidity_2m"][i])
+        rain.append(h["precipitation"][i])
+        cloud.append(h["cloudcover"][i])
+        wind.append(h["windspeed_10m"][i])
 
-    except Exception as e:
-        print("❌ Live weather API failed:", e)
-        return None
-
-
-def predict_rain(precipitation, humidity, cloud_cover):
-    if precipitation > 1 or (humidity > 80 and cloud_cover > 70):
-        return "High chance of rain"
-    return "Low chance of rain"
-
-
-def get_weather_data(place):
-    lat, lon = get_location(place)
-    if lat is None:
-        return None
-
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "daily": "temperature_2m_max,temperature_2m_min",
-        "timezone": "auto"
-    }
-
-    try:
-        r = requests.get(
-            OPEN_METEO_URL,
-            params=params,
-            headers=HEADERS,
-            timeout=20
-        )
-        r.raise_for_status()
-        data = r.json()
-
-        return {
-            "dates": data["daily"]["time"],
-            "temp_max": data["daily"]["temperature_2m_max"],
-            "temp_min": data["daily"]["temperature_2m_min"]
-        }
-
-    except Exception as e:
-        print("❌ Forecast API failed:", e)
-        return None
-
-
-def get_hourly_weather(lat, lon, hours=12):
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "temperature_2m",
-        "forecast_days": 1,
-        "timezone": "auto"
-    }
-
-    try:
-        r = requests.get(
-            OPEN_METEO_URL,
-            params=params,
-            headers=HEADERS,
-            timeout=20
-        )
-        r.raise_for_status()
-        data = r.json()
-
-        times = data["hourly"]["time"]
-        temps = data["hourly"]["temperature_2m"]
-
-        now = datetime.now()
-        hourly = []
-
-        for t, temp in zip(times, temps):
-            time_obj = datetime.fromisoformat(t)
-            if time_obj >= now:
-                hourly.append({
-                    "time": time_obj.strftime("%H:%M"),
-                    "temperature": round(float(temp), 1)
-                })
-            if len(hourly) == hours:
-                break
-
-        return hourly
-
-    except Exception as e:
-        print("❌ Hourly API failed:", e)
-        return None
-
-# ==================================================
-# HEALTH CHECK
-# ==================================================
-@app.get("/health")
-def health_check():
-    return {
-        "status": "ok",
-        "model_loaded": model is not None
-    }
-
-# ==================================================
-# LIVE + TOMORROW PREDICTION
-# ==================================================
-@app.post("/weather")
-def get_weather(request: WeatherRequest):
-    place = request.place.strip()
-    if not place:
-        return {"status": "error", "message": "Place is required"}
-
-    lat, lon = get_location(place)
-    if lat is None:
-        return {"status": "error", "message": "Location not found"}
-
-    weather = get_live_weather(lat, lon)
-    if weather is None:
-        return {
-            "place": place,
-            "status": "unavailable",
-            "message": "Weather service temporarily unavailable"
-        }
-
-    temperature = weather["temperature"]
-    humidity = weather["humidity"]
-    precipitation = weather["precipitation"]
-    cloud_cover = weather["cloud_cover"]
-    wind_speed = weather["wind_speed"]
-
-    feels_like = temperature + (humidity * 0.05)
-
-    predicted_temp = None
-    if model:
-        tomorrow = datetime.now() + timedelta(days=1)
-        model_input = pd.DataFrame([{
-            "tmin": temperature - 2,
-            "tmax": temperature + 2,
-            "prcp": precipitation,
-            "wspd": wind_speed,
-            "month": tomorrow.month,
-            "day": tomorrow.day
-        }])
-        predicted_temp = round(float(model.predict(model_input)[0]), 2)
-
-    return {
-        "place": place,
-        "coordinates": {"lat": lat, "lon": lon},
-        "live_weather": {
-            "temperature": round(temperature, 1),
-            "humidity": round(humidity, 0),
-            "precipitation": round(precipitation, 2),
-            "cloud_cover": round(cloud_cover, 0),
-            "wind_speed": round(wind_speed, 1),
-            "feels_like": round(feels_like, 1)
-        },
-        "tomorrow_prediction": {
-            "predicted_avg_temperature": predicted_temp,
-            "rain_status": predict_rain(precipitation, humidity, cloud_cover)
-        }
-    }
-
-# ==================================================
-# 7 DAY FORECAST
-# ==================================================
-@app.get("/forecast7")
-def forecast_7(place: str):
-    data = get_weather_data(place)
-    if not data:
-        return {
-            "place": place,
-            "status": "unavailable",
-            "message": "Forecast temporarily unavailable"
-        }
-
-    forecast = []
-    for d, tmax, tmin in zip(
-        data["dates"], data["temp_max"], data["temp_min"]
-    ):
-        forecast.append({
-            "date": d,
-            "tmax": round(float(tmax), 1),
-            "tmin": round(float(tmin), 1)
+        hourly_graph.append({
+            "time":dt.strftime("%H:%M"),
+            "temp":h["temperature_2m"][i]
         })
 
-    return {"place": place, "forecast": forecast}
+    return {
+        "feels_like": round(max(feels),1),
+        "humidity": round(sum(hum)/len(hum)),
+        "wind": round(max(wind),1),
+        "cloud": round(sum(cloud)/len(cloud)),
+        "rain": "Yes" if sum(rain)>0 else "No",
+        "hourly": hourly_graph
+    }
 
-# ==================================================
-# HOURLY FORECAST (UI GRAPH)
-# ==================================================
-@app.get("/hourly")
-def hourly_forecast(place: str, hours: int = 12):
-    lat, lon = get_location(place)
+# ================= MAIN LOAD =================
+@app.post("/weather")
+def weather(req: WeatherRequest):
+    lat,lon=get_location(req.place)
     if lat is None:
-        return {"status": "error", "message": "Location not found"}
+        raise HTTPException(404,"Place not found")
 
-    hourly = get_hourly_weather(lat, lon, hours)
-    if not hourly:
-        return {
-            "place": place,
-            "status": "unavailable",
-            "message": "Hourly data temporarily unavailable"
-        }
+    data=fetch_data(lat,lon)
+
+    daily_cards=[]
+    for i,d in enumerate(data["daily"]["time"]):
+        day=datetime.fromisoformat(d).strftime("%a")
+        daily_cards.append({
+            "day":day,
+            "temp":round(data["daily"]["temperature_2m_max"][i])
+        })
+
+    today_details=summarize_day(data,0)
 
     return {
-        "place": place,
-        "hours": hours,
-        "hourly_forecast": hourly
+        "place":req.place,
+        "today_temp":daily_cards[0]["temp"],
+        "daily_cards":daily_cards,
+        "details":today_details
     }
+
+# ================= DAY CLICK =================
+@app.get("/day-details")
+def day_details(place:str,day_index:int=0):
+    lat,lon=get_location(place)
+    if lat is None:
+        raise HTTPException(404,"Place not found")
+
+    data=fetch_data(lat,lon)
+    return summarize_day(data,day_index)
+
+# ================= HEALTH =================
+@app.get("/health")
+def health():
+    return {"status":"ok"}
